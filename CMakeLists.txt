@@ -53,6 +53,7 @@ target_link_libraries(TaskbarPerf PRIVATE
     gdi32
     dwmapi
     d2d1
+    d3d11
     dwrite
     dxgi
     pdh

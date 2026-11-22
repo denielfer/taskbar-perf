@@ -190,7 +190,7 @@ void DrawPinIcon(
     bool pinned,
     bool cardHovered,
     bool pinHovered) {
-    ID2D1DCRenderTarget* rt = surf.RT();
+    ID2D1RenderTarget* rt = surf.RT();
     ID2D1PathGeometry* pinGeo = res.PinGeometry();
     if (!rt || !pinGeo) return;
 
@@ -303,6 +303,9 @@ void FlyoutWindow::Hide() {
     if (hwnd_ && IsWindowVisible(hwnd_)) {
         ShowWindow(hwnd_, SW_HIDE);
     }
+    // A superficie (DIB + bitmaps) cresce com o quadrado da escala de DPI e ficaria presa
+    // para sempre; reabrir o painel a recria rapido.
+    surface_.Release();
 }
 
 void FlyoutWindow::ApplyDwmFrameStyle(bool isLight) {
@@ -364,7 +367,7 @@ bool FlyoutWindow::RenderToSurface(
         return false;
     }
 
-    ID2D1DCRenderTarget* rt = surf.RT();
+    ID2D1RenderTarget* rt = surf.RT();
     const auto items = BuildCardItems(snap, cfg, colors);
     const size_t n = items.size();
     const float cardsH = static_cast<float>(n) * kCardH +

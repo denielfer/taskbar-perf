@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metrics.h"
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -69,6 +70,34 @@ private:
         uint32_t kmtRetryAtTick = 0;  // backoff quando o driver nao suporta a consulta
     };
 
+    // Soma do contador "GPU Engine" por adaptador e engine ((phys << 16) | eng).
+    struct GpuEngineSum {
+        LuidKey luid;
+        uint32_t engine = 0;
+        double total = 0.0;
+    };
+
+    // Descricao estatica de um adaptador DXGI (reenumerado so quando a fabrica deixa de ser current).
+    struct CachedAdapter {
+        uint32_t luidLow = 0;
+        int32_t luidHigh = 0;
+        std::wstring name;
+        uint32_t vendorId = 0;
+        uint32_t deviceId = 0;
+        uint32_t subSysId = 0;
+        uint32_t revision = 0;
+        uint64_t dedicatedVideoMemory = 0;
+    };
+
+    // Interface de rede exibivel. A lista so e refeita quando o Windows avisa de mudanca
+    // (NotifyIpInterfaceChange/NotifyUnicastIpAddressChange) ou a cada ~1 min.
+    struct NetIfaceInfo {
+        uint64_t luid = 0;
+        std::wstring name;
+        std::wstring description;
+        bool isPhysical = false;
+    };
+
     struct DiskHistory {
         RingBuffer<60> history;
         uint32_t lastSeenTick = 0;
@@ -86,6 +115,10 @@ private:
     static std::wstring QueryDiskMediaType(int diskIndex);
     void CloseGpuAdapter(GpuState& st);
     void PruneStaleEntries();
+    void RebuildNetInterfaceList();
+    void RegisterNetChangeNotifications();
+    void RefreshAdapterCache();
+    static void MarkNetListDirty(void* ctx);
 
     void CollectCpu(CpuMetrics& out, bool recordHistory);
     void CollectRam(RamMetrics& out, bool recordHistory);
@@ -117,9 +150,20 @@ private:
 
     // DXGI/D3DKMT (criados uma vez; a fabrica e recriada quando deixa de ser "current")
     IDXGIFactory1* dxgiFactory_ = nullptr;
+    std::vector<CachedAdapter> adapters_;
+    bool adaptersValid_ = false;
     void* fnKmtOpenFromLuid_ = nullptr;
     void* fnKmtQueryAdapterInfo_ = nullptr;
     void* fnKmtCloseAdapter_ = nullptr;
+    std::vector<GpuEngineSum> gpuEngineScratch_;  // reaproveitado entre coletas
+
+    // Rede: lista de interfaces em cache + avisos de mudanca do Windows
+    std::vector<NetIfaceInfo> netIfaces_;
+    bool netListValid_ = false;
+    uint32_t netListBuiltTick_ = 0;
+    std::atomic<bool> netListDirty_{true};
+    void* netNotifyIf_ = nullptr;
+    void* netNotifyAddr_ = nullptr;
 
     // Metadados estaticos dos discos (indice = N de PhysicalDriveN)
     std::map<int, DiskStaticInfo> diskStaticCache_;

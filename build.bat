@@ -55,7 +55,7 @@ cl /nologo /std:c++20 /O2 /GL /MP /W4 /sdl /guard:cf /utf-8 /permissive- /EHsc ^
     "%ROOT%src\main.cpp" ^
     /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF ^
     /GUARD:CF /CETCOMPAT /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /DEPENDENTLOADFLAG:0x800 ^
-    user32.lib gdi32.lib dwmapi.lib d2d1.lib dwrite.lib dxgi.lib pdh.lib ^
+    user32.lib gdi32.lib dwmapi.lib d2d1.lib d3d11.lib dwrite.lib dxgi.lib pdh.lib ^
     iphlpapi.lib shell32.lib shcore.lib advapi32.lib ole32.lib powrprof.lib wtsapi32.lib
 if errorlevel 1 (
     echo [ERRO] Falha na compilacao.

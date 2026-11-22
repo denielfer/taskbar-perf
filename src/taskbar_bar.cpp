@@ -114,6 +114,124 @@ std::vector<ResolvedBarTile> ResolvePinnedBarTiles(
     return tiles;
 }
 
+constexpr float kPadX = 8.0f;
+constexpr float kGap = 6.0f;
+
+void LayoutFromTiles(
+    const std::vector<ResolvedBarTile>& tiles,
+    float maxWidthDip,
+    float taskbarHeightDip,
+    float& outWidthDip,
+    float& outHeightDip) {
+    float sum = kPadX * 2.0f + kGap * static_cast<float>(tiles.size() - 1);
+    for (const auto& t : tiles) {
+        sum += t.baseWidthDip;
+    }
+
+    if (maxWidthDip > 80.0f && sum > maxWidthDip) {
+        sum = maxWidthDip;
+    }
+
+    outWidthDip = std::max(72.0f, sum);
+    outHeightDip = std::clamp(taskbarHeightDip - 6.0f, 32.0f, 44.0f);
+}
+
+bool RenderTiles(
+    D2DResources& res,
+    D2DSurface& surf,
+    float widthDip,
+    float heightDip,
+    UINT dpi,
+    const std::vector<ResolvedBarTile>& tiles,
+    bool hovered,
+    const ThemeColors& colors) {
+    const int physW = std::max(1, MulDiv(static_cast<int>(widthDip + 0.5f), static_cast<int>(dpi), 96));
+    const int physH = std::max(1, MulDiv(static_cast<int>(heightDip + 0.5f), static_cast<int>(dpi), 96));
+
+    if (!surf.Resize(res, physW, physH, dpi)) {
+        return false;
+    }
+    if (!surf.BeginDraw(res, D2D1::ColorF(0, 0, 0, 0))) {
+        return false;
+    }
+
+    ID2D1RenderTarget* rt = surf.RT();
+    const D2D1_ROUNDED_RECT pill = D2D1::RoundedRect(
+        D2D1::RectF(0.5f, 0.5f, widthDip - 0.5f, heightDip - 0.5f),
+        6.0f, 6.0f);
+
+    if (auto* bgBrush = surf.Brush(hovered ? colors.barHoverBg : colors.barHitPillBg)) {
+        rt->FillRoundedRectangle(pill, bgBrush);
+    }
+
+    float rawTileSum = 0.0f;
+    for (const auto& t : tiles) rawTileSum += t.baseWidthDip;
+    const float availTileSpace = std::max(40.0f, widthDip - kPadX * 2.0f - kGap * static_cast<float>(tiles.size() - 1));
+    const float scale = (rawTileSum > 0.0f) ? std::min(1.0f, availTileSpace / rawTileSum) : 1.0f;
+
+    const float sparkY = 3.0f;
+    const float sparkH = std::max(20.0f, heightDip - 6.0f);
+
+    float x = kPadX;
+    for (const auto& tile : tiles) {
+        const float tw = tile.baseWidthDip * scale;
+        // O grafico nunca ocupa mais que ~45% do bloco, senao invade o vizinho quando a barra encolhe.
+        const float sparkW = std::min(std::clamp(sparkH * scale, 20.0f, 38.0f), std::max(10.0f, tw * 0.45f));
+        const D2D1_RECT_F sparkRect = D2D1::RectF(x, sparkY, x + sparkW, sparkY + sparkH);
+
+        SparklineStyle st{};
+        st.boxBg = colors.barBoxBg;
+        st.boxBorder = colors.barBoxBorder;
+        st.strokeWidth = 1.25f;
+        st.fillAlpha = 0.28f;
+        st.drawGrid = false;
+        st.lineColor = tile.color;
+        if (tile.secondary) {
+            st.secondary = tile.secondary;
+            st.secondaryColor = tile.secondaryColor;
+            st.secondaryStrokeStyle = res.DashedStroke();
+        }
+        if (tile.series) {
+            DrawSparkline(res, surf, sparkRect, *tile.series, tile.maxScale, st);
+        }
+
+        const float textLeft = x + sparkW + 5.0f;
+        const float textRight = x + tw;
+        if (textRight > textLeft + 10.0f) {
+            if (tile.value2.empty()) {
+                const float midY = sparkY + sparkH * 0.5f;
+                const D2D1_RECT_F labelRect = D2D1::RectF(textLeft, sparkY + 2.0f, textRight, midY + 1.0f);
+                const D2D1_RECT_F valueRect = D2D1::RectF(textLeft, midY - 1.0f, textRight, sparkY + sparkH - 2.0f);
+                if (auto* bMuted = surf.Brush(colors.barTextMuted)) {
+                    res.DrawTextCached(rt, tile.label, res.FmtBarLabel(), labelRect, bMuted);
+                }
+                if (auto* bPrim = surf.Brush(colors.barTextPrimary)) {
+                    res.DrawTextCached(rt, tile.value, res.FmtBarValue(), valueRect, bPrim);
+                }
+            } else {
+                const float top = 1.5f;
+                const float bot = heightDip - 1.5f;
+                const float availH = std::max(24.0f, bot - top);
+                const float h1 = availH * 0.31f;
+                const float h2 = availH * 0.345f;
+                const D2D1_RECT_F r1 = D2D1::RectF(textLeft, top, textRight, top + h1);
+                const D2D1_RECT_F r2 = D2D1::RectF(textLeft, top + h1 - 0.5f, textRight, top + h1 + h2);
+                const D2D1_RECT_F r3 = D2D1::RectF(textLeft, top + h1 + h2 - 0.5f, textRight, bot);
+                if (auto* bMuted = surf.Brush(colors.barTextMuted)) {
+                    res.DrawTextCached(rt, tile.label, res.FmtBarSmallLabel(), r1, bMuted);
+                }
+                if (auto* bPrim = surf.Brush(colors.barTextPrimary)) {
+                    res.DrawTextCached(rt, tile.value, res.FmtBarSmallValue(), r2, bPrim);
+                    res.DrawTextCached(rt, tile.value2, res.FmtBarSmallValue(), r3, bPrim);
+                }
+            }
+        }
+
+        x += tw + kGap;
+    }
+    return surf.EndDraw();
+}
+
 } // namespace
 
 TaskbarBarWindow::~TaskbarBarWindow() {
@@ -193,21 +311,7 @@ void TaskbarBarWindow::ComputeLayoutDip(
     float& outWidthDip,
     float& outHeightDip) {
     const ThemeColors dummyColors{};
-    const auto tiles = ResolvePinnedBarTiles(cfg, snap, dummyColors);
-    constexpr float kPadX = 8.0f;
-    constexpr float kGap = 6.0f;
-
-    float sum = kPadX * 2.0f + kGap * static_cast<float>(tiles.size() - 1);
-    for (const auto& t : tiles) {
-        sum += t.baseWidthDip;
-    }
-
-    if (maxWidthDip > 80.0f && sum > maxWidthDip) {
-        sum = maxWidthDip;
-    }
-
-    outWidthDip = std::max(72.0f, sum);
-    outHeightDip = std::clamp(taskbarHeightDip - 6.0f, 32.0f, 44.0f);
+    LayoutFromTiles(ResolvePinnedBarTiles(cfg, snap, dummyColors), maxWidthDip, taskbarHeightDip, outWidthDip, outHeightDip);
 }
 
 bool TaskbarBarWindow::RenderToSurface(
@@ -220,95 +324,7 @@ bool TaskbarBarWindow::RenderToSurface(
     const AppConfig& cfg,
     bool hovered,
     const ThemeColors& colors) {
-    const int physW = std::max(1, MulDiv(static_cast<int>(widthDip + 0.5f), static_cast<int>(dpi), 96));
-    const int physH = std::max(1, MulDiv(static_cast<int>(heightDip + 0.5f), static_cast<int>(dpi), 96));
-
-    if (!surf.Resize(res, physW, physH, dpi)) {
-        return false;
-    }
-    if (!surf.BeginDraw(res, D2D1::ColorF(0, 0, 0, 0))) {
-        return false;
-    }
-
-    ID2D1DCRenderTarget* rt = surf.RT();
-    const D2D1_ROUNDED_RECT pill = D2D1::RoundedRect(
-        D2D1::RectF(0.5f, 0.5f, widthDip - 0.5f, heightDip - 0.5f),
-        6.0f, 6.0f);
-
-    if (auto* bgBrush = surf.Brush(hovered ? colors.barHoverBg : colors.barHitPillBg)) {
-        rt->FillRoundedRectangle(pill, bgBrush);
-    }
-
-    const auto tiles = ResolvePinnedBarTiles(cfg, snap, colors);
-    constexpr float kPadX = 8.0f;
-    constexpr float kGap = 6.0f;
-
-    float rawTileSum = 0.0f;
-    for (const auto& t : tiles) rawTileSum += t.baseWidthDip;
-    const float availTileSpace = std::max(40.0f, widthDip - kPadX * 2.0f - kGap * static_cast<float>(tiles.size() - 1));
-    const float scale = (rawTileSum > 0.0f) ? std::min(1.0f, availTileSpace / rawTileSum) : 1.0f;
-
-    const float sparkY = 3.0f;
-    const float sparkH = std::max(20.0f, heightDip - 6.0f);
-
-    float x = kPadX;
-    for (const auto& tile : tiles) {
-        const float tw = tile.baseWidthDip * scale;
-        // O grafico nunca ocupa mais que ~45% do bloco, senao invade o vizinho quando a barra encolhe.
-        const float sparkW = std::min(std::clamp(sparkH * scale, 20.0f, 38.0f), std::max(10.0f, tw * 0.45f));
-        const D2D1_RECT_F sparkRect = D2D1::RectF(x, sparkY, x + sparkW, sparkY + sparkH);
-
-        SparklineStyle st{};
-        st.boxBg = colors.barBoxBg;
-        st.boxBorder = colors.barBoxBorder;
-        st.strokeWidth = 1.25f;
-        st.fillAlpha = 0.28f;
-        st.drawGrid = false;
-        st.lineColor = tile.color;
-        if (tile.secondary) {
-            st.secondary = tile.secondary;
-            st.secondaryColor = tile.secondaryColor;
-            st.secondaryStrokeStyle = res.DashedStroke();
-        }
-        if (tile.series) {
-            DrawSparkline(res, surf, sparkRect, *tile.series, tile.maxScale, st);
-        }
-
-        const float textLeft = x + sparkW + 5.0f;
-        const float textRight = x + tw;
-        if (textRight > textLeft + 10.0f) {
-            if (tile.value2.empty()) {
-                const float midY = sparkY + sparkH * 0.5f;
-                const D2D1_RECT_F labelRect = D2D1::RectF(textLeft, sparkY + 2.0f, textRight, midY + 1.0f);
-                const D2D1_RECT_F valueRect = D2D1::RectF(textLeft, midY - 1.0f, textRight, sparkY + sparkH - 2.0f);
-                if (auto* bMuted = surf.Brush(colors.barTextMuted)) {
-                    rt->DrawText(tile.label.c_str(), static_cast<UINT32>(tile.label.size()), res.FmtBarLabel(), labelRect, bMuted);
-                }
-                if (auto* bPrim = surf.Brush(colors.barTextPrimary)) {
-                    rt->DrawText(tile.value.c_str(), static_cast<UINT32>(tile.value.size()), res.FmtBarValue(), valueRect, bPrim);
-                }
-            } else {
-                const float top = 1.5f;
-                const float bot = heightDip - 1.5f;
-                const float availH = std::max(24.0f, bot - top);
-                const float h1 = availH * 0.31f;
-                const float h2 = availH * 0.345f;
-                const D2D1_RECT_F r1 = D2D1::RectF(textLeft, top, textRight, top + h1);
-                const D2D1_RECT_F r2 = D2D1::RectF(textLeft, top + h1 - 0.5f, textRight, top + h1 + h2);
-                const D2D1_RECT_F r3 = D2D1::RectF(textLeft, top + h1 + h2 - 0.5f, textRight, bot);
-                if (auto* bMuted = surf.Brush(colors.barTextMuted)) {
-                    rt->DrawText(tile.label.c_str(), static_cast<UINT32>(tile.label.size()), res.FmtBarSmallLabel(), r1, bMuted);
-                }
-                if (auto* bPrim = surf.Brush(colors.barTextPrimary)) {
-                    rt->DrawText(tile.value.c_str(), static_cast<UINT32>(tile.value.size()), res.FmtBarSmallValue(), r2, bPrim);
-                    rt->DrawText(tile.value2.c_str(), static_cast<UINT32>(tile.value2.size()), res.FmtBarSmallValue(), r3, bPrim);
-                }
-            }
-        }
-
-        x += tw + kGap;
-    }
-    return surf.EndDraw();
+    return RenderTiles(res, surf, widthDip, heightDip, dpi, ResolvePinnedBarTiles(cfg, snap, colors), hovered, colors);
 }
 
 void TaskbarBarWindow::UpdateAndRender(
@@ -338,15 +354,17 @@ void TaskbarBarWindow::UpdateAndRender(
     const float tbDipH = static_cast<float>(tbPhysH) * 96.0f / static_cast<float>(tb.dpi);
     const float maxDipW = tbDipW * 0.48f;
 
+    // Blocos resolvidos uma vez so para o layout e o desenho (formatam todos os textos).
+    const auto tiles = ResolvePinnedBarTiles(cfg, snap, colors);
     float widthDip = 0.0f;
     float heightDip = 0.0f;
-    ComputeLayoutDip(cfg, snap, maxDipW, tbDipH, widthDip, heightDip);
+    LayoutFromTiles(tiles, maxDipW, tbDipH, widthDip, heightDip);
     lastWidthDip_ = widthDip;
     lastHeightDip_ = heightDip;
 
-    // RenderToSurface ja fecha o EndDraw: nenhuma mensagem enviada daqui em diante
+    // RenderTiles ja fecha o EndDraw: nenhuma mensagem enviada daqui em diante
     // encontra um BeginDraw aberto.
-    if (!RenderToSurface(res, surface_, widthDip, heightDip, tb.dpi, snap, cfg, isHovered_, colors)) {
+    if (!RenderTiles(res, surface_, widthDip, heightDip, tb.dpi, tiles, isHovered_, colors)) {
         return;
     }
 
