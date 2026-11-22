@@ -2,7 +2,7 @@
 
 Monitor de desempenho leve para a barra de tarefas do Windows 11, com gráficos em tempo real inspirados no Gerenciador de Tarefas e painel completo em *flyout*.
 
-> **Outra versão:** existe uma implementação independente da mesma ideia em Zig 0.15, no repositório **`taskbar-perf-zig`** (*TaskbarPerf Zig*). Ela ocupa o espaço livre da metade esquerda da barra (medido por UI Automation) e tem um painel próprio. Esta versão em C++ é a mais completa em configuração: escolha de métricas, de monitor e de posição, além de iniciar com o Windows.
+> **Outra versão:** existe uma implementação independente da mesma ideia em Zig 0.15, no repositório [**`taskbar-perf-zig`**](https://github.com/denielfer/taskbar-perf-zig) (*TaskbarPerf Zig*). Ela ocupa o espaço livre da metade esquerda da barra (medido por UI Automation) e tem um painel próprio. Esta versão em C++ é a mais completa em configuração: escolha de métricas, de monitor e de posição, além de iniciar com o Windows.
 
 ## Recursos
 
