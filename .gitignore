@@ -1,0 +1,21 @@
+# Saídas de build
+/build/
+/build-cmake/
+/out/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.res
+
+# A versão Zig é um repositório separado (taskbar-perf-zig)
+/zig/
+
+# Notas locais
+/REVISAO*.md
+/AUDITORIA.md
+
+# Editores
+.vs/
+.vscode/
