@@ -80,6 +80,7 @@ using FnD3DKMTOpenAdapterFromLuid = LONG(NTAPI*)(LocalD3DKMT_OPENADAPTERFROMLUID
 using FnD3DKMTQueryAdapterInfo = LONG(NTAPI*)(LocalD3DKMT_QUERYADAPTERINFO*);
 using FnD3DKMTCloseAdapter = LONG(NTAPI*)(LocalD3DKMT_CLOSEADAPTER*);
 
+constexpr uint32_t kNetListRefreshTicks = 60;    // rede de seguranca: refaz a lista de interfaces a cada ~1 min
 constexpr uint32_t kPdhRetryEveryTicks = 60;     // tenta reabrir contadores ausentes a cada ~1 min
 constexpr uint32_t kPruneEveryTicks = 60;
 constexpr uint32_t kStaleAfterTicks = 300;       // remove estado de dispositivos sumidos ha ~5 min
@@ -199,6 +200,20 @@ bool ParseGpuLuid(std::wstring_view name, uint32_t& luidLow, int32_t& luidHigh, 
     return true;
 }
 
+// "phys_0_eng_3_engtype_3D" -> (phys << 16) | eng. Identifica o engine sem copiar a string.
+uint32_t ParseEngineKey(std::wstring_view tail) {
+    auto readNum = [&](std::wstring_view tag) -> uint32_t {
+        const size_t p = tail.find(tag);
+        if (p == std::wstring_view::npos) return 0xFFFF;
+        uint32_t v = 0;
+        for (size_t i = p + tag.size(); i < tail.size() && std::iswdigit(tail[i]) && v < 0xFFFF; ++i) {
+            v = v * 10 + static_cast<uint32_t>(tail[i] - L'0');
+        }
+        return std::min<uint32_t>(v, 0xFFFF);
+    };
+    return (readNum(L"phys_") << 16) | readNum(L"eng_");
+}
+
 HANDLE OpenDeviceNoAccess(const wchar_t* path) {
     // Acesso 0: so consultas (IOCTL de propriedades), sem ler a midia.
     return CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -249,6 +264,16 @@ MetricsCollector::MetricsCollector() {
 }
 
 MetricsCollector::~MetricsCollector() {
+    // Cancela os avisos de rede antes de qualquer coisa: o callback recebe "this".
+    // CancelMibChangeNotify2 espera um callback em andamento terminar.
+    if (netNotifyIf_) {
+        CancelMibChangeNotify2(static_cast<HANDLE>(netNotifyIf_));
+        netNotifyIf_ = nullptr;
+    }
+    if (netNotifyAddr_) {
+        CancelMibChangeNotify2(static_cast<HANDLE>(netNotifyAddr_));
+        netNotifyAddr_ = nullptr;
+    }
     for (auto& [_, st] : gpuState_) {
         CloseGpuAdapter(st);
     }
@@ -263,8 +288,38 @@ bool MetricsCollector::Initialize() {
     OpenPdhQuery();
     AddMissingPdhCounters();
     RefreshDiskStaticCache(true);
+    RegisterNetChangeNotifications();
     ResetBaselines();
     return true;
+}
+
+void MetricsCollector::MarkNetListDirty(void* ctx) {
+    if (ctx) {
+        static_cast<MetricsCollector*>(ctx)->netListDirty_.store(true, std::memory_order_relaxed);
+    }
+}
+
+void MetricsCollector::RegisterNetChangeNotifications() {
+    // Chamados numa thread do pool do Windows: so marcam a lista como suja; quem refaz
+    // a lista e a propria coleta. Sem os avisos, a lista ainda e refeita a cada ~1 min.
+    if (!netNotifyIf_) {
+        HANDLE h = nullptr;
+        if (NotifyIpInterfaceChange(
+                AF_UNSPEC,
+                [](PVOID ctx, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE) { MarkNetListDirty(ctx); },
+                this, FALSE, &h) == NO_ERROR) {
+            netNotifyIf_ = h;
+        }
+    }
+    if (!netNotifyAddr_) {
+        HANDLE h = nullptr;
+        if (NotifyUnicastIpAddressChange(
+                AF_UNSPEC,
+                [](PVOID ctx, PMIB_UNICASTIPADDRESS_ROW, MIB_NOTIFICATION_TYPE) { MarkNetListDirty(ctx); },
+                this, FALSE, &h) == NO_ERROR) {
+            netNotifyAddr_ = h;
+        }
+    }
 }
 
 void MetricsCollector::ResumeAfterPause() {
@@ -683,7 +738,10 @@ void MetricsCollector::CollectDisks(SystemSnapshot& out, bool recordHistory) {
     }
 }
 
-void MetricsCollector::CollectNetworks(SystemSnapshot& out, uint64_t nowUs, bool recordHistory) {
+void MetricsCollector::RebuildNetInterfaceList() {
+    // Limpa antes de consultar: um aviso que chegue durante a consulta marca de novo.
+    netListDirty_.store(false, std::memory_order_relaxed);
+
     constexpr ULONG kFlags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
     if (adapterAddrBuffer_.empty()) {
         adapterAddrBuffer_.resize((16 * 1024) / sizeof(uint64_t));
@@ -699,10 +757,11 @@ void MetricsCollector::CollectNetworks(SystemSnapshot& out, uint64_t nowUs, bool
         }
     }
     if (ret != ERROR_SUCCESS) {
+        netListDirty_.store(true, std::memory_order_relaxed);  // tenta de novo na proxima coleta
         return;
     }
 
-    std::vector<NetMetrics> collected;
+    std::vector<NetIfaceInfo> fresh;
     for (auto* aa = reinterpret_cast<const IP_ADAPTER_ADDRESSES*>(adapterAddrBuffer_.data()); aa != nullptr; aa = aa->Next) {
         if (aa->OperStatus != IfOperStatusUp) continue;
         if (aa->IfType == IF_TYPE_SOFTWARE_LOOPBACK || aa->IfType == IF_TYPE_TUNNEL) continue;
@@ -719,18 +778,49 @@ void MetricsCollector::CollectNetworks(SystemSnapshot& out, uint64_t nowUs, bool
 
         MIB_IF_ROW2 row{};
         row.InterfaceLuid = aa->Luid;
-        if (GetIfEntry2(&row) != NO_ERROR) {
-            continue;
-        }
-        if (row.InterfaceAndOperStatusFlags.FilterInterface) {
+        if (GetIfEntry2(&row) != NO_ERROR || row.InterfaceAndOperStatusFlags.FilterInterface) {
             continue;
         }
 
-        const bool isPhysical = (row.InterfaceAndOperStatusFlags.ConnectorPresent != FALSE) &&
-                                !ContainsCaseInsensitive(desc, L"Virtual") &&
-                                !ContainsCaseInsensitive(desc, L"VPN");
+        NetIfaceInfo info;
+        info.luid = aa->Luid.Value;
+        info.isPhysical = (row.InterfaceAndOperStatusFlags.ConnectorPresent != FALSE) &&
+                          !ContainsCaseInsensitive(desc, L"Virtual") &&
+                          !ContainsCaseInsensitive(desc, L"VPN");
+        info.name = friendly.empty() ? desc : std::move(friendly);
+        info.description = std::move(desc);
+        fresh.push_back(std::move(info));
+    }
 
-        const uint64_t luidVal = row.InterfaceLuid.Value;
+    std::stable_sort(fresh.begin(), fresh.end(), [](const NetIfaceInfo& a, const NetIfaceInfo& b) {
+        if (a.isPhysical != b.isPhysical) return a.isPhysical > b.isPhysical;
+        return a.name < b.name;
+    });
+    netIfaces_ = std::move(fresh);
+    netListValid_ = true;
+    netListBuiltTick_ = tickCounter_;
+}
+
+void MetricsCollector::CollectNetworks(SystemSnapshot& out, uint64_t nowUs, bool recordHistory) {
+    // GetAdaptersAddresses monta a tabela inteira (enderecos, gateways) e e cara para rodar a
+    // cada segundo: agora so roda quando a rede muda. No tick basta um GetIfEntry2 por interface.
+    if (!netListValid_ || netListDirty_.load(std::memory_order_relaxed) ||
+        (recordHistory && tickCounter_ - netListBuiltTick_ >= kNetListRefreshTicks)) {
+        RebuildNetInterfaceList();
+    }
+
+    std::vector<NetMetrics> collected;
+    collected.reserve(netIfaces_.size());
+    for (const NetIfaceInfo& info : netIfaces_) {
+        MIB_IF_ROW2 row{};
+        row.InterfaceLuid.Value = info.luid;
+        if (GetIfEntry2(&row) != NO_ERROR || row.OperStatus != IfOperStatusUp) {
+            // Caiu/sumiu entre dois avisos: some ja e a lista e refeita na proxima coleta.
+            netListDirty_.store(true, std::memory_order_relaxed);
+            continue;
+        }
+
+        const uint64_t luidVal = info.luid;
         NetPrevSample& prev = netState_[luidVal];
         prev.lastSeenTick = tickCounter_;
 
@@ -756,9 +846,9 @@ void MetricsCollector::CollectNetworks(SystemSnapshot& out, uint64_t nowUs, bool
 
         NetMetrics nm;
         nm.luid = luidVal;
-        nm.name = friendly.empty() ? desc : friendly;
-        nm.description = desc;
-        nm.isPhysical = isPhysical;
+        nm.name = info.name;
+        nm.description = info.description;
+        nm.isPhysical = info.isPhysical;
         nm.sendBps = sendBps;
         nm.recvBps = recvBps;
         nm.maxScaleBps = prev.maxScaleBps;
@@ -766,28 +856,64 @@ void MetricsCollector::CollectNetworks(SystemSnapshot& out, uint64_t nowUs, bool
         nm.recvHistory = prev.recvHistory;
         collected.push_back(std::move(nm));
     }
+    out.nets = std::move(collected);  // netIfaces_ ja esta ordenada (fisicas primeiro, por nome)
+}
 
-    std::stable_sort(collected.begin(), collected.end(), [](const NetMetrics& a, const NetMetrics& b) {
-        if (a.isPhysical != b.isPhysical) return a.isPhysical > b.isPhysical;
-        return a.name < b.name;
-    });
-    out.nets = std::move(collected);
+void MetricsCollector::RefreshAdapterCache() {
+    adapters_.clear();
+    if (!dxgiFactory_) return;
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT idx = 0; dxgiFactory_->EnumAdapters1(idx, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++idx) {
+        DXGI_ADAPTER_DESC1 desc{};
+        if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+            continue;
+        }
+        const bool dup = std::any_of(adapters_.begin(), adapters_.end(), [&](const CachedAdapter& a) {
+            return a.luidLow == desc.AdapterLuid.LowPart && a.luidHigh == desc.AdapterLuid.HighPart;
+        });
+        if (dup) continue;
+        CachedAdapter ca;
+        ca.luidLow = desc.AdapterLuid.LowPart;
+        ca.luidHigh = desc.AdapterLuid.HighPart;
+        ca.name = desc.Description;
+        ca.vendorId = desc.VendorId;
+        ca.deviceId = desc.DeviceId;
+        ca.subSysId = desc.SubSysId;
+        ca.revision = desc.Revision;
+        ca.dedicatedVideoMemory = desc.DedicatedVideoMemory;
+        adapters_.push_back(std::move(ca));
+    }
 }
 
 void MetricsCollector::CollectGpus(SystemSnapshot& out, bool recordHistory) {
     // 1. Uso por engine e VRAM dedicada via PDH (mesma metodologia do Gerenciador de Tarefas:
     //    soma dos processos por engine, e o uso da GPU e o maior engine).
-    std::unordered_map<LuidKey, std::unordered_map<std::wstring, double>, LuidKeyHash> gpuEngineTotals;
+    //    (D3DKMTQueryStatistics por no foi avaliado: uma chamada cara por engine a cada
+    //    segundo sai mais caro que o PDH.)
+    std::vector<GpuEngineSum>& gpuEngineTotals = gpuEngineScratch_;
+    gpuEngineTotals.clear();
     std::unordered_map<LuidKey, double, LuidKeyHash> gpuDedicatedMemBytes;
 
     if (recordHistory) {
+        // Centenas de instancias (processo x engine) por segundo: soma num vetor pequeno, sem
+        // alocar uma string por instancia como chave de mapa.
         ReadPdhArray(pdhGpuEngine_, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, [&](std::wstring_view name, double val) {
             uint32_t low = 0;
             int32_t high = 0;
             std::wstring_view engine;
-            if (ParseGpuLuid(name, low, high, &engine) && !engine.empty()) {
-                gpuEngineTotals[{low, high}][std::wstring(engine)] += std::max(0.0, val);
+            if (!ParseGpuLuid(name, low, high, &engine) || engine.empty()) {
+                return;
             }
+            const LuidKey lk{low, high};
+            const uint32_t engKey = ParseEngineKey(engine);
+            auto it = std::find_if(gpuEngineTotals.begin(), gpuEngineTotals.end(), [&](const GpuEngineSum& e) {
+                return e.engine == engKey && e.luid == lk;
+            });
+            if (it == gpuEngineTotals.end()) {
+                gpuEngineTotals.push_back({lk, engKey, 0.0});
+                it = std::prev(gpuEngineTotals.end());
+            }
+            it->total += std::max(0.0, val);
         });
     }
     ReadPdhArray(pdhGpuMem_, PDH_FMT_DOUBLE, [&](std::wstring_view name, double val) {
@@ -798,65 +924,60 @@ void MetricsCollector::CollectGpus(SystemSnapshot& out, bool recordHistory) {
         }
     });
 
-    // 2. Adaptadores via DXGI (fabrica reaproveitada enquanto continuar valida)
+    // 2. Adaptadores via DXGI. A fabrica e a lista ficam em cache enquanto IsCurrent() (barato)
+    //    disser que nada mudou; reenumerar a cada segundo era trabalho repetido.
     if (dxgiFactory_ && !dxgiFactory_->IsCurrent()) {
         dxgiFactory_->Release();
         dxgiFactory_ = nullptr;
     }
     if (!dxgiFactory_) {
+        adaptersValid_ = false;
         if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&dxgiFactory_)))) {
             dxgiFactory_ = nullptr;
             return;
         }
+    }
+    if (!adaptersValid_) {
+        RefreshAdapterCache();
+        adaptersValid_ = true;
     }
 
     const auto fnOpen = reinterpret_cast<FnD3DKMTOpenAdapterFromLuid>(fnKmtOpenFromLuid_);
     const auto fnQuery = reinterpret_cast<FnD3DKMTQueryAdapterInfo>(fnKmtQueryAdapterInfo_);
     constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
-    std::vector<LuidKey> seenLuids;
     std::vector<std::array<uint32_t, 4>> seenPciIds;  // para numerar placas identicas
-    ComPtr<IDXGIAdapter1> adapter;
-    for (UINT idx = 0; dxgiFactory_->EnumAdapters1(idx, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++idx) {
-        DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-            continue;
-        }
-        const LuidKey lk{desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart};
-        if (std::find(seenLuids.begin(), seenLuids.end(), lk) != seenLuids.end()) {
-            continue;
-        }
-        seenLuids.push_back(lk);
-
+    for (const CachedAdapter& ad : adapters_) {
+        const LuidKey lk{ad.luidLow, ad.luidHigh};
         GpuState& st = gpuState_[lk];
         st.lastSeenTick = tickCounter_;
 
         GpuMetrics gm;
-        gm.luid = desc.AdapterLuid;
+        gm.luid.LowPart = ad.luidLow;
+        gm.luid.HighPart = ad.luidHigh;
         gm.index = static_cast<int>(out.gpus.size());
-        gm.name = desc.Description;
-        gm.vendorId = desc.VendorId;
-        gm.deviceId = desc.DeviceId;
-        gm.subSysId = desc.SubSysId;
-        gm.revision = desc.Revision;
-        const std::array<uint32_t, 4> pciId{desc.VendorId, desc.DeviceId, desc.SubSysId, desc.Revision};
+        gm.name = ad.name;
+        gm.vendorId = ad.vendorId;
+        gm.deviceId = ad.deviceId;
+        gm.subSysId = ad.subSysId;
+        gm.revision = ad.revision;
+        const std::array<uint32_t, 4> pciId{ad.vendorId, ad.deviceId, ad.subSysId, ad.revision};
         gm.occurrence = static_cast<uint32_t>(std::count(seenPciIds.begin(), seenPciIds.end(), pciId));
         seenPciIds.push_back(pciId);
-        gm.vramTotalGb = static_cast<double>(desc.DedicatedVideoMemory) / kGiB;
+        gm.vramTotalGb = static_cast<double>(ad.dedicatedVideoMemory) / kGiB;
 
         // Sem o contador PDH a VRAM em uso do sistema e desconhecida (QueryVideoMemoryInfo
         // so informa o uso deste processo, por isso nao serve de fallback).
         auto memIt = gpuDedicatedMemBytes.find(lk);
         gm.vramUsedGb = (memIt != gpuDedicatedMemBytes.end()) ? memIt->second / kGiB : -1.0;
 
-        auto engIt = gpuEngineTotals.find(lk);
-        if (engIt != gpuEngineTotals.end()) {
-            double maxEng = 0.0;
-            for (const auto& [_, val] : engIt->second) {
-                maxEng = std::max(maxEng, val);
+        double maxEng = 0.0;
+        for (const GpuEngineSum& e : gpuEngineTotals) {
+            if (e.luid == lk) {
+                maxEng = std::max(maxEng, e.total);
             }
-            gm.utilizationPct = std::clamp(maxEng, 0.0, 100.0);
         }
+        gm.utilizationPct = std::clamp(maxEng, 0.0, 100.0);
 
         // 3. Temperatura via D3DKMT (handle aberto uma vez por adaptador)
         bool freshlyOpened = false;
@@ -864,7 +985,7 @@ void MetricsCollector::CollectGpus(SystemSnapshot& out, bool recordHistory) {
             static_cast<int32_t>(tickCounter_ - st.kmtRetryAtTick) >= 0) {
             st.kmtOpenTried = true;
             LocalD3DKMT_OPENADAPTERFROMLUID oa{};
-            oa.AdapterLuid = desc.AdapterLuid;
+            oa.AdapterLuid = gm.luid;
             if (fnOpen(&oa) == 0) {
                 st.kmtAdapter = oa.hAdapter;
                 freshlyOpened = true;

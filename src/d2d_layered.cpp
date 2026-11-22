@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 bool D2DResources::Initialize() {
@@ -97,7 +98,86 @@ bool D2DResources::CreateTextFormat(
     return true;
 }
 
+ID2D1Device* D2DResources::Device() {
+    if (d2dDevice_) {
+        return d2dDevice_.Get();
+    }
+    if (deviceFailed_ || !d2dFactory_) {
+        return nullptr;
+    }
+    Microsoft::WRL::ComPtr<ID2D1Factory1> factory1;
+    if (FAILED(d2dFactory_.As(&factory1))) {
+        deviceFailed_ = true;
+        return nullptr;
+    }
+    // WARP = rasterizador em CPU, sem depender de driver nem acordar a GPU. Sem as flags
+    // abaixo ele espalha o trabalho num pool de threads (varias trocas de contexto por quadro).
+    const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                       D3D11_CREATE_DEVICE_SINGLETHREADED |
+                       D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS;
+    Microsoft::WRL::ComPtr<ID3D11Device> d3d;
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgi;
+    Microsoft::WRL::ComPtr<ID2D1Device> dev;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags, nullptr, 0,
+                                 D3D11_SDK_VERSION, d3d.GetAddressOf(), nullptr, nullptr)) ||
+        FAILED(d3d.As(&dxgi)) ||
+        FAILED(factory1->CreateDevice(dxgi.Get(), dev.GetAddressOf())) || !dev) {
+        deviceFailed_ = true;  // fica no DC render target em software
+        return nullptr;
+    }
+    d3dDevice_ = std::move(d3d);
+    d2dDevice_ = std::move(dev);
+    return d2dDevice_.Get();
+}
+
+void D2DResources::ResetDevice() {
+    d2dDevice_.Reset();
+    d3dDevice_.Reset();
+    ++deviceGen_;  // superficies com contexto do dispositivo antigo recriam o seu
+}
+
+void D2DResources::DrawTextCached(
+    ID2D1RenderTarget* rt,
+    const std::wstring& text,
+    IDWriteTextFormat* fmt,
+    const D2D1_RECT_F& rect,
+    ID2D1Brush* brush) {
+    if (!rt || !fmt || !brush || !dwriteFactory_) return;
+    const float w = std::max(0.0f, rect.right - rect.left);
+    const float h = std::max(0.0f, rect.bottom - rect.top);
+
+    // Chave: ponteiro do formato + tamanho da caixa (em centesimos de DIP) + texto.
+    wchar_t prefix[64]{};
+    swprintf_s(prefix, L"%p|%d|%d|", static_cast<void*>(fmt),
+               static_cast<int>(std::lround(w * 100.0f)), static_cast<int>(std::lround(h * 100.0f)));
+    std::wstring key(prefix);
+    key += text;
+
+    const uint64_t now = ++textUseCounter_;
+    auto it = textLayouts_.find(key);
+    if (it == textLayouts_.end()) {
+        Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+        if (FAILED(dwriteFactory_->CreateTextLayout(
+                text.c_str(), static_cast<UINT32>(text.size()), fmt, w, h, layout.GetAddressOf())) || !layout) {
+            return;
+        }
+        // Poda: descarta o que nao foi usado nas ultimas ~256 chamadas (alguns quadros).
+        constexpr uint64_t kKeepUses = 256;
+        if (textLayouts_.size() >= kKeepUses) {
+            for (auto e = textLayouts_.begin(); e != textLayouts_.end();) {
+                e = (now - e->second.lastUse > kKeepUses) ? textLayouts_.erase(e) : std::next(e);
+            }
+        }
+        it = textLayouts_.emplace(std::move(key), TextLayoutEntry{std::move(layout), now}).first;
+    }
+    it->second.lastUse = now;
+    rt->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), it->second.layout.Get(), brush);
+}
+
 void D2DResources::Shutdown() {
+    textLayouts_.clear();
+    d2dDevice_.Reset();
+    d3dDevice_.Reset();
     fmtHeaderTitle_.Reset();
     fmtHeaderBtn_.Reset();
     fmtCardTitle_.Reset();
@@ -116,9 +196,23 @@ D2DSurface::~D2DSurface() {
     Release();
 }
 
-void D2DSurface::Release() {
+void D2DSurface::DropRenderTarget() {
     brush_.Reset();
-    rt_.Reset();
+    staging_.Reset();
+    target_.Reset();
+    dc_.Reset();
+    dcGen_ = 0;
+    bitmapsW_ = 0;
+    bitmapsH_ = 0;
+    bitmapsDpi_ = 0;
+    dcrt_.Reset();
+    dcrtBound_ = false;
+    active_ = nullptr;
+}
+
+void D2DSurface::Release() {
+    DropRenderTarget();
+    res_ = nullptr;
     if (memDC_) {
         if (oldBmp_) {
             SelectObject(memDC_, oldBmp_);
@@ -142,12 +236,28 @@ void D2DSurface::Release() {
 }
 
 bool D2DSurface::EnsureRenderTarget(D2DResources& res) {
-    if (rt_) {
-        return true;
-    }
     if (!res.Factory()) {
         return false;
     }
+    if (ID2D1Device* device = res.Device()) {
+        if (dc_ && dcGen_ == res.DeviceGeneration()) {
+            return true;
+        }
+        DropRenderTarget();
+        if (FAILED(device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, dc_.GetAddressOf())) || !dc_) {
+            dc_.Reset();
+            return false;
+        }
+        dcGen_ = res.DeviceGeneration();
+        dc_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        active_ = dc_.Get();
+        return true;
+    }
+
+    if (dcrt_) {
+        return true;
+    }
+    DropRenderTarget();
     const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
         D2D1_RENDER_TARGET_TYPE_SOFTWARE,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
@@ -156,10 +266,43 @@ bool D2DSurface::EnsureRenderTarget(D2DResources& res) {
         D2D1_RENDER_TARGET_USAGE_NONE,
         D2D1_FEATURE_LEVEL_DEFAULT);
 
-    if (FAILED(res.Factory()->CreateDCRenderTarget(&props, rt_.GetAddressOf())) || !rt_) {
+    if (FAILED(res.Factory()->CreateDCRenderTarget(&props, dcrt_.GetAddressOf())) || !dcrt_) {
+        dcrt_.Reset();
         return false;
     }
-    rt_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dcrt_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dcrtBound_ = false;
+    active_ = dcrt_.Get();
+    return true;
+}
+
+bool D2DSurface::EnsureDeviceBitmaps() {
+    if (target_ && staging_ && bitmapsW_ == width_ && bitmapsH_ == height_ && bitmapsDpi_ == dpi_) {
+        return true;
+    }
+    dc_->SetTarget(nullptr);
+    target_.Reset();
+    staging_.Reset();
+    bitmapsW_ = 0;
+    bitmapsH_ = 0;
+    bitmapsDpi_ = 0;
+
+    const D2D1_PIXEL_FORMAT fmt = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED);
+    const float dpi = static_cast<float>(dpi_);
+    const D2D1_SIZE_U size = D2D1::SizeU(static_cast<UINT32>(width_), static_cast<UINT32>(height_));
+    const D2D1_BITMAP_PROPERTIES1 targetProps = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET, fmt, dpi, dpi);
+    const D2D1_BITMAP_PROPERTIES1 stagingProps = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW, fmt, dpi, dpi);
+    if (FAILED(dc_->CreateBitmap(size, nullptr, 0, &targetProps, target_.GetAddressOf())) ||
+        FAILED(dc_->CreateBitmap(size, nullptr, 0, &stagingProps, staging_.GetAddressOf()))) {
+        target_.Reset();
+        staging_.Reset();
+        return false;
+    }
+    dc_->SetTarget(target_.Get());
+    bitmapsW_ = width_;
+    bitmapsH_ = height_;
+    bitmapsDpi_ = dpi_;
     return true;
 }
 
@@ -225,13 +368,14 @@ bool D2DSurface::Resize(D2DResources& res, int physW, int physH, UINT dpi) {
     }
     width_ = physW;
     height_ = physH;
+    dcrtBound_ = false;  // DIB novo: o DCRT (fallback) precisa religar
     return true;
 }
 
 ID2D1SolidColorBrush* D2DSurface::Brush(D2D1_COLOR_F color) {
-    if (!rt_) return nullptr;
+    if (!active_) return nullptr;
     if (!brush_) {
-        if (FAILED(rt_->CreateSolidColorBrush(color, brush_.GetAddressOf()))) {
+        if (FAILED(active_->CreateSolidColorBrush(color, brush_.GetAddressOf()))) {
             return nullptr;
         }
     } else {
@@ -244,34 +388,63 @@ bool D2DSurface::BeginDraw(D2DResources& res, D2D1_COLOR_F clearColor) {
     if (drawing_ || !memDC_ || !dib_ || !EnsureRenderTarget(res)) {
         return false;
     }
-    RECT rc{0, 0, width_, height_};
-    if (FAILED(rt_->BindDC(memDC_, &rc))) {
-        brush_.Reset();
-        rt_.Reset();
-        if (!EnsureRenderTarget(res) || FAILED(rt_->BindDC(memDC_, &rc))) {
-            brush_.Reset();
-            rt_.Reset();
+    res_ = &res;
+    if (dc_) {
+        if (!EnsureDeviceBitmaps()) {
+            DropRenderTarget();
             return false;
         }
+    } else if (!dcrtBound_) {
+        // BindDC e uma parte grande do custo do quadro: so religa quando o DIB ou o alvo mudam.
+        RECT rc{0, 0, width_, height_};
+        if (FAILED(dcrt_->BindDC(memDC_, &rc))) {
+            DropRenderTarget();
+            if (!EnsureRenderTarget(res) || !dcrt_ || FAILED(dcrt_->BindDC(memDC_, &rc))) {
+                DropRenderTarget();
+                return false;
+            }
+        }
+        dcrtBound_ = true;
     }
-    rt_->SetDpi(static_cast<float>(dpi_), static_cast<float>(dpi_));
-    rt_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    rt_->BeginDraw();
-    rt_->Clear(clearColor);
+    active_->SetDpi(static_cast<float>(dpi_), static_cast<float>(dpi_));
+    active_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    active_->BeginDraw();
+    active_->Clear(clearColor);
     drawing_ = true;
     hasContent_ = false;
     return true;
 }
 
 bool D2DSurface::EndDraw() {
-    if (!rt_ || !drawing_) return false;
+    if (!active_ || !drawing_) return false;
     drawing_ = false;
-    const HRESULT hr = rt_->EndDraw();
+    hasContent_ = false;
+    const HRESULT hr = active_->EndDraw();
     if (FAILED(hr)) {
-        brush_.Reset();
-        rt_.Reset();
-        hasContent_ = false;
+        if (dc_ && hr == D2DERR_RECREATE_TARGET && res_) {
+            res_->ResetDevice();
+        }
+        DropRenderTarget();
         return false;
+    }
+
+    if (dc_) {
+        // Copia o quadro do bitmap do WARP para o DIB usado por UpdateLayeredWindow/BitBlt.
+        D2D1_MAPPED_RECT mapped{};
+        if (FAILED(staging_->CopyFromBitmap(nullptr, target_.Get(), nullptr)) ||
+            FAILED(staging_->Map(D2D1_MAP_OPTIONS_READ, &mapped))) {
+            DropRenderTarget();
+            return false;
+        }
+        GdiFlush();  // nenhuma operacao GDI pendente no DIB antes de escrever nele
+        const size_t rowBytes = static_cast<size_t>(width_) * 4;
+        auto* dst = static_cast<uint8_t*>(bits_);
+        for (int y = 0; y < height_; ++y) {
+            std::memcpy(dst + rowBytes * static_cast<size_t>(y),
+                        mapped.bits + static_cast<size_t>(mapped.pitch) * static_cast<size_t>(y),
+                        rowBytes);
+        }
+        staging_->Unmap();
     }
     hasContent_ = true;
     return true;
@@ -319,7 +492,7 @@ void DrawSparkline(
     const RingBuffer<60>& series,
     double maxScale,
     const SparklineStyle& style) {
-    ID2D1DCRenderTarget* rt = surf.RT();
+    ID2D1RenderTarget* rt = surf.RT();
     ID2D1Factory* factory = res.Factory();
     if (!rt || !factory) return;
 

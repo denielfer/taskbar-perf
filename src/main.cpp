@@ -563,7 +563,8 @@ void AppController::SyncBarsAndRender() {
         if (b->Hwnd()) ownBarHwnds.push_back(b->Hwnd());
     }
 
-    lastTaskbars_ = EnumerateTaskbars(cfg_.allMonitors, cfg_.monitorId, flyout_.Hwnd(), ownBarHwnds);
+    lastTaskbars_ = EnumerateTaskbars(
+        cfg_.allMonitors, cfg_.monitorId, flyout_.Hwnd(), ownBarHwnds, cfg_.hideOnFullscreen);
 
     // Remove barras cujo monitor nao deve mais exibir o app
     bars_.erase(
@@ -902,6 +903,7 @@ LRESULT CALLBACK AppController::ControllerWndProc(HWND hwnd, UINT msg, WPARAM wP
 
 LRESULT AppController::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msgTaskbarCreated_ != 0 && msg == msgTaskbarCreated_) {
+        InvalidateDisplayMetadataCache();
         AddOrRefreshTrayIcon();
         UpdateLocationHook();
         SyncBarsAndRender();
@@ -923,13 +925,31 @@ LRESULT AppController::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_DISPLAYCHANGE:
-    case WM_SETTINGCHANGE:
+        InvalidateDisplayMetadataCache();
         colors_ = GetThemeColors(IsSystemLightTheme());
         if (!IsPaused()) {
             SyncBarsAndRender();
             flyout_.UpdateIfVisible(d2d_, snapshot_, cfg_, colors_);
         }
         return 0;
+
+    case WM_SETTINGCHANGE: {
+        // Qualquer programa pode transmitir WM_SETTINGCHANGE (variaveis de ambiente, politicas...):
+        // so reage a troca de tema claro/escuro e a mudanca da area de trabalho (barra).
+        const auto* area = reinterpret_cast<const wchar_t*>(lParam);
+        const bool themeChanged = area && wcscmp(area, L"ImmersiveColorSet") == 0;
+        if (!themeChanged && wParam != SPI_SETWORKAREA) {
+            return 0;
+        }
+        if (themeChanged) {
+            colors_ = GetThemeColors(IsSystemLightTheme());
+        }
+        if (!IsPaused()) {
+            SyncBarsAndRender();
+            flyout_.UpdateIfVisible(d2d_, snapshot_, cfg_, colors_);
+        }
+        return 0;
+    }
 
     case WM_POWERBROADCAST:
         if (wParam == PBT_POWERSETTINGCHANGE) {

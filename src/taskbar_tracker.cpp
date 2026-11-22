@@ -98,6 +98,19 @@ std::vector<DisplayMetaEntry> QueryDisplayMetadata() {
     return entries;
 }
 
+// QueryDisplayConfig + 2 DisplayConfigGetDeviceInfo por caminho a cada segundo, para
+// dados que so mudam quando a topologia de monitores muda: fica em cache (so na thread de UI).
+std::vector<DisplayMetaEntry> g_displayMetaCache;
+bool g_displayMetaCacheValid = false;
+
+const std::vector<DisplayMetaEntry>& CachedDisplayMetadata(bool forceRefresh) {
+    if (forceRefresh || !g_displayMetaCacheValid) {
+        g_displayMetaCache = QueryDisplayMetadata();
+        g_displayMetaCacheValid = true;
+    }
+    return g_displayMetaCache;
+}
+
 std::wstring FallbackFriendlyName(const wchar_t* deviceName) {
     DISPLAY_DEVICEW adapter{};
     adapter.cb = sizeof(adapter);
@@ -233,7 +246,8 @@ TaskbarInfo BuildDisplayTaskbarInfo(
     const std::vector<DisplayMetaEntry>& metas,
     const ForegroundState& fgState,
     HWND ownFlyoutHwnd,
-    const std::vector<HWND>& ownBarHwnds) {
+    const std::vector<HWND>& ownBarHwnds,
+    bool* metaMissing) {
     TaskbarInfo info;
     info.monitor = hMon;
 
@@ -256,6 +270,7 @@ TaskbarInfo BuildDisplayTaskbarInfo(
     }
     if (info.monitorId.empty()) {
         info.monitorId = info.deviceName;
+        if (metaMissing) *metaMissing = true;
     }
     if (info.friendlyName.empty()) {
         info.friendlyName = FallbackFriendlyName(info.deviceName.c_str());
@@ -335,11 +350,16 @@ bool MatchesMonitorId(const TaskbarInfo& tb, const std::wstring& monitorId) {
     return !tb.deviceName.empty() && EqualsIgnoreCase(tb.deviceName, monitorId);
 }
 
+void InvalidateDisplayMetadataCache() {
+    g_displayMetaCacheValid = false;
+}
+
 std::vector<TaskbarInfo> EnumerateAllDisplays(
     HWND ownFlyoutHwnd,
-    const std::vector<HWND>& ownBarHwnds) {
-    const ForegroundState fgState = QueryForegroundState();
-    const std::vector<DisplayMetaEntry> metas = QueryDisplayMetadata();
+    const std::vector<HWND>& ownBarHwnds,
+    bool detectFullscreen) {
+    // Sem "Ocultar em tela cheia" o estado de tela cheia nao e usado: pula a consulta.
+    const ForegroundState fgState = detectFullscreen ? QueryForegroundState() : ForegroundState{};
 
     std::vector<TaskbarWindowEntry> tbWins;
     if (HWND primary = FindWindowExW(nullptr, nullptr, L"Shell_TrayWnd", nullptr)) {
@@ -354,18 +374,29 @@ std::vector<TaskbarInfo> EnumerateAllDisplays(
     EnumDisplayMonitors(nullptr, nullptr, CollectMonitorProc, reinterpret_cast<LPARAM>(&enumCtx));
 
     std::vector<TaskbarInfo> result;
-    result.reserve(enumCtx.monitors.size());
-    for (HMONITOR hMon : enumCtx.monitors) {
-        const TaskbarWindowEntry* matchTb = nullptr;
-        for (const auto& entry : tbWins) {
-            if (entry.monitor == hMon) {
-                matchTb = &entry;
-                break;
+    // Monitor sem entrada no cache (topologia mudou antes do WM_DISPLAYCHANGE chegar):
+    // reconsulta os metadados uma vez e refaz a lista.
+    for (int pass = 0; pass < 2; ++pass) {
+        const auto& metas = CachedDisplayMetadata(pass > 0);
+        bool metaMissing = false;
+        result.clear();
+        result.reserve(enumCtx.monitors.size());
+        for (HMONITOR hMon : enumCtx.monitors) {
+            const TaskbarWindowEntry* matchTb = nullptr;
+            for (const auto& entry : tbWins) {
+                if (entry.monitor == hMon) {
+                    matchTb = &entry;
+                    break;
+                }
+            }
+            TaskbarInfo info = BuildDisplayTaskbarInfo(
+                hMon, matchTb, metas, fgState, ownFlyoutHwnd, ownBarHwnds, &metaMissing);
+            if (!info.deviceName.empty()) {
+                result.push_back(std::move(info));
             }
         }
-        TaskbarInfo info = BuildDisplayTaskbarInfo(hMon, matchTb, metas, fgState, ownFlyoutHwnd, ownBarHwnds);
-        if (!info.deviceName.empty()) {
-            result.push_back(std::move(info));
+        if (!metaMissing) {
+            break;
         }
     }
 
@@ -382,8 +413,9 @@ std::vector<TaskbarInfo> EnumerateTaskbars(
     bool allMonitors,
     const std::wstring& selectedMonitorId,
     HWND ownFlyoutHwnd,
-    const std::vector<HWND>& ownBarHwnds) {
-    std::vector<TaskbarInfo> displays = EnumerateAllDisplays(ownFlyoutHwnd, ownBarHwnds);
+    const std::vector<HWND>& ownBarHwnds,
+    bool detectFullscreen) {
+    std::vector<TaskbarInfo> displays = EnumerateAllDisplays(ownFlyoutHwnd, ownBarHwnds, detectFullscreen);
     std::vector<TaskbarInfo> result;
 
     if (!selectedMonitorId.empty()) {
